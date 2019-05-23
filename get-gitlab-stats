@@ -1,0 +1,862 @@
+#!/bin/bash
+################################################################################
+################################################################################
+####### Get GitLab Project statistics###########################################
+################################################################################
+################################################################################
+
+# LEGEND:
+# This script will use the GitLab API to list all projects
+# and sizes for an organization
+# It will return an output.csv with the following statistics:
+#
+#  Group name
+#  Repo name
+#  Number of issues
+#  Number of issue notes
+#  Number of MRs
+#  Number of MR notes
+#  Repo Size
+#  Fork Parent Name
+#  Flagged if there's a potential naming collision with repos in other groups
+#
+# This will work for users on GitLab that are trying to figure out
+# how many projects they own, and how large they are.
+# This can be used by services to help distinguish what projects
+# could be an issue, as well as help prepare for a migration
+#
+# PREREQS:
+# You need to have the following to run this script successfully:
+# - GitLab Personal Access Token with a scope of "api" and 
+#   "sudo" (required on GitLab CE and EE) and access to the organization(s) 
+#   that will be analyzed
+# - jq installed on the machine running the query
+#
+# NOTES:
+# - Repositories under 1 mb will be shown as 0mb
+#
+
+#################################
+# Print Usage information  
+#################################
+usage() {
+  cat <<EOM
+Usage: get-gitlab-stats [options] GROUP_NAME
+
+Description:
+get-gitlab-stats scans an organization or list of organizations for all repositories and gathers size statistics for each repository
+
+Options:
+    -h, --help                : Show script help
+    -v, --verbose             : Enable verbose logging
+    -u, --url                 : Set GHE URL (e.g. https://gitlab-example.com) Looks for GITLAB_URL 
+                                environment variable or defaults to gitlab.com if omitted
+    -i, --input               : Set path to a file with a list of organizations to scan
+    -t, --token               : Set Personal Access Token with site_admin and delete_repo scope - Looks 
+                                for GITLAB_TOKEN environment variable if omitted
+    -a, --all-groups          : Analyze all groups on a private instance of GitLab (will not work on https://gitlab.com). 
+                                This supercedes any list of orgs or a single org provided when calling the script
+    -n, --get-notes           : Gets all issue and merge-request notes
+    -s, --get-repo-size       : Gets the disk usage for each repository in kb
+    -c, --analyze-conflicts   : Checks the Project Name against projects in other groups and generates a list of potential
+                                naming conflicts if those groups are to be merged during migration
+
+
+Examples:
+    Provide the url and personal access token and get the default information (group, project, issue count, merge-request count, fork-parent-name)
+      get-gitlab-stats -u https://gitlab-example.com -t ABCDEFG1234567 my-org-name
+    Get issue and merge request notes and repository disk usage
+      get-gitlab-stats -s -n
+    Analyze potential naming conflicts if groups were to be merged during migration
+      get-gitlab-stats -c
+
+EOM
+  exit 0
+}
+
+DEBUG=0
+
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -h|--help)
+      usage;
+      ;;
+    -u|--url)
+      GITLAB_URL=$2
+      shift 2
+      ;;
+    -a|--all-groups)
+      ALL_GROUPS=1
+      shift
+      ;;
+    -c|--analyze-conflicts)
+      ANALYZE_CONFLICTS=1
+      shift
+      ;;
+    -n|--get-notes)
+      GET_NOTES=1
+      shift
+      ;;    
+    --get-commit-comments)
+      GET_COMMIT_COMMENTS=1
+      shift
+      ;;
+    -s|--get-repo-size)
+      GET_REPO_SIZE=1
+      shift
+      ;;
+    -v|--verbose)
+      DEBUG=1
+      shift
+      ;;
+    -t|--token)
+      GITLAB_TOKEN=$2
+      shift 2
+      ;;
+    -i|--input)
+      INPUT_FILE_NAME=$2
+      shift 2
+      ;;
+    --) # end argument parsing
+      shift
+      break
+      ;;
+    -*|--*=) # unsupported flags
+      echo "Error: Unsupported flag $1" >&2
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAMS="$PARAMS $1"
+      shift
+      ;;
+  esac
+done
+
+
+
+# Set positional arguments in their proper place
+eval set -- "$PARAMS"
+
+FILENAME=$1
+
+verbose_jq() {
+  if [[ $VERBOSE == true ]]; then 
+    echo $1 | jq '.'
+  fi
+}
+
+verbose() {
+  if [[ $VERBOSE == true ]]; then 
+    echo $1
+  fi
+}
+
+###########
+# GLOBALS #
+###########
+
+
+PAGE_SIZE=100            # Default is 100, GitLab limit is 100
+
+group_name=$1
+
+################################################################################
+############################ FUNCTIONS #########################################
+################################################################################
+################################################################################
+
+#### Function Header ###########################################################
+Header()
+{
+  echo ""
+  echo "######################################################"
+  echo "######################################################"
+  echo "############# GitLab project list and sizer #############"
+  echo "######################################################"
+  echo "######################################################"
+  echo ""
+
+  if [[ -z ${GITLAB_URL} ]]; then	
+    GITLAB_URL="https://gitlab.com"
+  fi
+
+
+
+  # Clean any whitespace that may be entered
+  gitlab_url_no_whitespace="$(echo -e "${GITLAB_URL}" | tr -d '[:space:]')"
+  GITLAB_URL=$gitlab_url_no_whitespace
+
+  get_token
+
+  # Set the URL
+  GITLAB_URL+="/api/v4"
+
+  # Validate we can hit the endpoint by getting the current user
+
+  user_response=$(curl -w ' %{http_code}' -sk --request GET \
+    --url ${GITLAB_URL}/user \
+    --header "private-token: ${GITLAB_TOKEN}")
+
+  echo $user_response
+
+  user_response_code="${user_response:(-3)}"
+  user_data="${user_response::${#user_response}-4}"
+
+  if [ $DEBUG -eq 1 ]; then
+    echo $user_data | jq '.'
+  fi
+
+  if [[ "$user_response_code" != "200" ]]; then
+    echo "Error getting user"
+    echo "${user_data}"
+  else
+    user_login=$(echo $user_data | jq -r '.username')
+    # Check for success
+    if [[ -z $user_login ]]; then
+      # Got bad return
+      echo "ERROR! Failed to validate GHE instance:[$GITLAB_URL]"
+      echo "Received error: $user_data"
+      exit 1
+    else
+      # Got positive return
+      echo "Successfully validated GHE Instance..."
+    fi
+  fi
+
+  if [[ ${ALL_GROUPS} -eq 1 ]]; then
+    if [[ "${GITLAB_URL}" = "https://gitlab.com/api/v4" ]]; then
+      echo "You specified the option, -a or --all-groups, but specified gitlab.com"
+      echo "as your source. You can only scan all groups on a GitLab Server instance."
+      echo "Please specify a group that you would like to scan."
+      ALL_GROUPS=0
+    fi
+  fi
+
+  if [[ -z ${group_name} ]] && [[ -z ${INPUT_FILE_NAME} ]] && [[ ${ALL_GROUPS} -ne 1 ]]; then
+    ###########################################
+    # Get the name of the GitLab Group #
+    ###########################################
+    echo ""
+    echo "------------------------------------------------------"
+    echo "Please enter name of the GitLab Group you wish to"
+    echo "gather information from, followed by [ENTER]:"
+    ########################
+    # Read input from user #
+    ########################
+    read group_name
+
+    # Clean any whitespace that may be enetered
+    group_name_no_whitespace="$(echo -e "${group_name}" | tr -d '[:space:]')"
+    group_name=$group_name_no_whitespace
+
+    # Validate the Org Name
+    if [ ${#group_name} -le 1 ]; then
+      echo "Error! You must give a valid Group name!"
+      exit 1
+    fi
+  fi
+  get_token
+}
+
+################################################################################
+#### Function Footer ###########################################################
+Footer()
+{
+  #######################################
+  # Basic footer information and totals #
+  #######################################
+  echo ""
+  echo "######################################################"
+  echo "The script has completed"
+  echo "Results file:[$stats_output_file]"
+  echo "######################################################"
+  echo ""
+  echo ""
+}
+
+get_token() {
+  if [[ -z ${GITLAB_TOKEN} ]]; then
+    ########################################
+    # Get the GitLab Personal Access Token #
+    ########################################
+    echo ""
+    echo "------------------------------------------------------"
+    echo "Please create a GitLab Personal Access Token used to gather"
+    echo "information from your Organization, with a scope of 'api',"
+    echo "followed by [ENTER]:"
+    echo "(note: your input will NOT be displayed)"
+    ########################
+    # Read input from user #
+    ########################
+    read -s GITLAB_TOKEN
+  fi
+  # Clean any whitespace that may be enetered
+  gitlab_token_no_whitespace="$(echo -e "${GITLAB_TOKEN}" | tr -d '[:space:]')"
+  GITLAB_TOKEN=$gitlab_token_no_whitespace
+}
+
+################################################################################
+#### Function GenerateFiles #####################################################
+GenerateFiles()
+{
+  # Get datestring YYYYMMDDHHMM
+  DATE=$(date +%Y%m%d%H%M)
+  stats_output_file="all_repos-$DATE.csv"
+  stats_header="group,project,issues,merge_requests"
+
+  if [[ ${GET_NOTES} -eq 1 ]]; then
+    stats_header=",issue_request_notes,merge_request_notes"
+  fi
+  if [[ ${GET_COMMIT_COMMENTS} -eq 1 ]]; then
+    stats_header+=",commit_comments"
+  fi  
+  if [[ ${GET_REPO_SIZE} -eq 1 ]]; then
+    stats_header+=",repo_size (kb)"
+  fi
+  stats_header+=",fork_parents"
+
+  echo "${stats_header}" > $stats_output_file
+
+  if [ $? -ne 0 ]; then
+    echo "Failed to generate result file: $stats_output_file!"
+    exit 1
+  fi
+
+  if [[ ${ANALYZE_CONFLICTS} -eq 1 ]]; then
+    conflict_output_file="naming-conflicts-$DATE.csv"
+    echo "conflict qty, project name, group names" > $conflict_output_file
+
+    if [ $? -ne 0 ]; then
+      echo "Failed to generate result file: $conflict_output_file!"
+      exit 1
+    fi
+  fi
+}
+
+GetOrgsFromFile()
+{
+  while IFS=, read -r login
+  do
+    group_name=${login}
+    GetProjects
+
+  done < ${INPUT_FILE_NAME}
+}
+
+GetGroups()
+{
+  if [ $DEBUG -eq 1 ]; then
+    echo "Getting groups"
+    echo curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    $GITLAB_URL/groups?page=$next_group_page'&'per_page=$PAGE_SIZE
+  fi
+
+  group_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+  "$GITLAB_URL/groups?page=$next_group_page&per_page=$PAGE_SIZE")
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- Groups RESPONSE:"
+      echo $group_response
+    fi
+
+  group_response_code=$(echo "${group_response:(-3)}")
+  group_data=$(echo "${group_response}" | grep -Fi '{')
+  next_group_page=$(echo "${group_response}" | grep -Fi X-Next-Page | sed 's/^[^:]*: //' | tr -d '\015')
+
+  if [[ "$group_response_code" != "200" ]]; then
+    echo "Error getting Groups for Instance: $GITLAB_URL"
+    echo "${group_data}"
+  else
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- Project data block:"
+      echo $group_data | jq '.'
+    fi
+
+
+    AnalyzeGroups "${group_data}"
+
+
+    # See if we need to loop for more data
+    if [ -z ${next_group_page} ]; then
+      # We have all the data, we can move on
+      echo "Gathered all data from GitLab"
+    else
+      # We need to loop through GitLab to get all projects
+      echo "More pages of projects... Looping through data on page: ${next_group_page}"
+      GetGroups
+    fi
+  fi
+}
+
+AnalyzeGroups()
+{
+  groups=$1
+  echo "Parsing group data"
+  for group in $(echo "${groups}" | jq -r '.[] | @base64'); do
+    _jq() {
+      echo ${group} | base64 --decode | jq -r ${1}
+    }
+
+    group_name=$(_jq '.path')
+    GetProjects
+
+  done
+}
+
+################################################################################
+#### Function GetProjects ##########################################################
+GetProjects()
+{
+  if [ $DEBUG -eq 1 ]; then
+    echo "Getting projects"
+    echo curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    $GITLAB_URL/groups/$group_name/projects?page=$next_repo_page'&'per_page=$PAGE_SIZE
+  fi
+
+  repo_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+  "$GITLAB_URL/groups/$group_name/projects?page=$next_repo_page&per_page=$PAGE_SIZE")
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- project RESPONSE:"
+      echo $repo_response
+    fi
+
+  repo_response_code=$(echo "${repo_response:(-3)}")
+  repo_data=$(echo "${repo_response}" | grep -Fi '{')
+  next_repo_page=$(echo "${repo_response}" | grep -Fi X-Next-Page | sed 's/^[^:]*: //' | tr -d '\015')
+
+  if [[ "$repo_response_code" != "200" ]]; then
+    echo "Error getting Repos for Org: $group_name"
+    echo "${repo_data}"
+  else
+
+    #########################
+    # DEBUG show data block #
+    #########################
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- project DATA BLOCK:"
+      echo $repo_data | jq '.'
+    fi
+
+    #############################################
+    # Parse all the project data out of data block #
+    #############################################
+    AnalyzeProjects "${repo_data}"
+
+    ########################################
+    # See if we need to loop for more data #
+    ########################################
+    if [ -z ${next_repo_page} ]; then
+      # We have all the data, we can move on
+      echo "Gathered all data from GitLab"
+    else
+      # We need to loop through GitLab to get all projects
+      echo "More pages of projects... Looping through data on page: ${next_repo_page}"
+      ######################################
+      # Call GetProjects again with new cursor #
+      ######################################
+      GetProjects
+    fi
+  fi
+}
+
+AnalyzeProjects()
+{
+  ##########################
+  # Pull in the data block #
+  ##########################
+  projects=$1
+  echo "Parsing project data"
+  for project in $(echo "${projects}" | jq -r '.[] | @base64'); do
+    _jq() {
+      echo ${project} | base64 --decode | jq -r ${1}
+    }
+
+    _jq '.'
+    owner=$(_jq '.namespace.path')
+    project_name=$(_jq '.path')
+    project_id=$(_jq '.id')
+    fork_parent=$(_jq '.forked_from_project?.path_with_namespace')
+    echo "Analyzing project: ${owner}/${project_name}"
+
+    total_issue_note_ct=0
+    total_mr_note_ct=0
+    issue_ct=0
+    mr_ct=0
+
+    next_issue_page=1
+    GetIssues
+
+    next_mr_page=1
+    GetMergeRequests
+
+    output_string=$(echo "${group_name},${project_name},${issue_ct},${mr_ct}")
+
+    if [[ ${GET_NOTES} -eq 1 ]]; then
+      output_string+=",${total_issue_note_ct},${total_mr_note_ct}"
+    fi
+
+    if [[ "${GET_COMMIT_COMMENTS}" -eq 1 ]]; then
+      next_commit_page=1
+      total_commit_comment_ct=0
+      GetCommits
+      output_string+=",${total_commit_comment_ct}"
+    fi
+
+    GetRepoSize
+
+    if [[ "${fork_parent}" != "null" ]]; then
+      output_string+=",${fork_parent}"
+    fi
+
+
+
+    echo "${output_string}" >> $stats_output_file
+
+    if [[ ${ANALYZE_CONFLICTS} -eq 1 ]]; then
+      ### Check the project name against array of all previously-processed projects
+      project_index=-1
+
+      for i in "${!project_list[@]}"; do
+        if [[ "${project_list[$i]}" = "${project_name}" ]]; then
+            project_index=$(echo "${i}")
+        fi
+      done
+
+      ### If this is the first instance of that project name, add it to the list and add the group name to its array
+      if [[ ${project_index} -eq -1 ]]; then
+        project_list+=(${project_name})
+        group_list[(( ${#project_list[@]} - 1 ))]=${group_name}
+        number_of_conflicts[(( ${#project_list[@]} - 1 ))]=1
+      else
+        group_list[${project_index}]+=" ${group_name}"
+        (( number_of_conflicts[${project_index}]++ ))
+      fi
+    fi
+
+  done
+}
+
+GetIssues(){
+
+  if [ $DEBUG -eq 1 ]; then
+    echo "Getting issues"
+    curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    \"$GITLAB_URL/projects/$project_id/issues?page=$next_issue_page&per_page=$PAGE_SIZE\"
+  fi
+
+  issue_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+  "$GITLAB_URL/projects/$project_id/issues?page=$next_issue_page&per_page=$PAGE_SIZE")
+
+
+  issue_response_code=$(echo "${issue_response:(-3)}")
+  issue_data=$(echo "${issue_response}" | grep -Fi '{')
+  next_issue_page=$(echo "${issue_response}" | grep -Fi X-Next-Page | sed 's/^[^:]*: //' | tr -d '\015')
+  issue_ct=$(echo "${issue_response}" | grep -Fi X-Total: | sed 's/^[^:]*: //' | tr -d '\015')
+
+  if [[ "$issue_response_code" != "200" ]]; then
+    echo "Error getting Issues for project: $owner/$project_name"
+    echo "${issue_data}"
+  else
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- issue DATA BLOCK:"
+      echo $issue_data | jq '.'
+    fi
+    if [[ ${GET_NOTES} -eq 1 ]]; then
+      AnalyzeIssues "${issue_data}"
+    fi
+  fi
+}
+
+AnalyzeIssues()
+{
+  issues=$1
+
+  for issue in $(echo "${issues}" | jq -r '.[] | @base64'); do
+    _issue_jq() {
+     echo ${issue} | base64 --decode | jq -r ${1}
+    }
+
+    issue_note_ct=$(_issue_jq '.user_notes_count')
+
+    total_issue_note_ct=$((${total_issue_note_ct} + ${issue_note_ct}))
+  done
+
+
+  ########################################
+  # See if we need to loop for more data #
+  ########################################
+  if [[ -z $next_issue_page  ]]; then
+    # We have all the data, we can move on
+    echo "Gathered all issues"
+  else
+    # We need to loop through GitLab to get all projects
+    echo "More pages of issues... Looping through data on page:$next_issue_page"
+
+    ######################################
+    # Call GetIssues with new cursor #
+    ######################################
+    GetIssues
+  fi
+
+}
+
+GetMergeRequests(){
+
+  if [ $DEBUG -eq 1 ]; then
+    echo "Getting merge requests"
+    echo curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    \"$GITLAB_URL/projects/$project_id/merge_requests?page=$next_mr_page&per_page=$PAGE_SIZE\"
+  fi
+
+  mr_response=$(curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+  "$GITLAB_URL/projects/$project_id/merge_requests?page=$next_mr_page&per_page=$PAGE_SIZE")
+
+  mr_response_code=$(echo "${mr_response:(-3)}")
+  mr_data=$(echo "${mr_response}" | grep -Fi '{')
+  next_mr_page=$(echo "${mr_response}" | grep -Fi X-Next-Page | sed 's/^[^:]*: //' | tr -d '\015')
+  mr_ct=$(echo "${mr_response}" | grep -Fi X-Total: | sed 's/^[^:]*: //' | tr -d '\015')
+
+  if [[ "$mr_response_code" != "200" ]]; then
+    echo "Error getting Issues for project: $owner/$project_name"
+    echo "${mr_data}"
+  else
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- Merge Request data block:"
+      echo $mr_data | jq '.'
+    fi
+    if [[ ${GET_NOTES} -eq 1 ]]; then
+      AnalyzeMergeRequests "${mr_data}"
+    fi
+  fi
+}
+
+AnalyzeMergeRequests()
+{
+  mrs=$1
+
+  for issue in $(echo "${mrs}" | jq -r '.[] | @base64'); do
+    _mr_jq() {
+     echo ${issue} | base64 --decode | jq -r ${1}
+    }
+
+    mr_note_ct=$(_mr_jq '.user_notes_count')
+
+    total_mr_note_ct=$((${total_mr_note_ct} + ${mr_note_ct}))
+  done
+
+
+  ########################################
+  # See if we need to loop for more data #
+  ########################################
+  if [[ -z $next_mr_page  ]]; then
+    # We have all the data, we can move on
+    echo "Gathered all merge requests"
+  else
+    # We need to loop through GitLab to get all projects
+    echo "More pages of merge requests... Looping through data on page:$next_mr_page]"
+
+    ######################################
+    # Call GetIssues with new cursor #
+    ######################################
+    GetMergeRequests
+  fi
+}
+
+GetCommits(){
+  echo "Getting commits"
+  if [ $DEBUG -eq 1 ]; then
+    echo curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    \"$GITLAB_URL/projects/$project_id/repository/commits?page=$next_commit_page'&'per_page=$PAGE_SIZE\"
+  fi
+
+  commit_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+  "$GITLAB_URL/projects/$project_id/repository/commits?page=$next_commit_page&per_page=$PAGE_SIZE")
+
+
+  commit_response_code=$(echo "${commit_response:(-3)}")
+  commit_data=$(echo "${commit_response}" | grep -Fi '{')
+  next_commit_page=$(echo "${commit_response}" | grep -Fi X-Next-Page | sed 's/^[^:]*: //' | tr -d '\015')
+
+  if [[ "$commit_response_code" != "200" ]]; then
+    echo "Error getting Commits for project: $owner/$project_name"
+    echo "${commit_data}"
+  else
+
+    if [ $DEBUG -eq 1 ]; then
+      echo "DEBUG --- commit DATA BLOCK:"
+      echo $commit_data | jq '.'
+    fi
+
+    GetCommitComments "${commit_data}"
+  fi
+
+  # See if we need to loop for more data
+  if [[ -z $next_commit_page  ]]; then
+    # We have all the data, we can move on
+    echo "Gathered all commits"
+  else
+    # We need to loop through GitLab to get all projects
+    echo "More pages of commits... Looping through data on page:$next_commit_page"
+
+    ######################################
+    # Call GetCommits with new cursor #
+    ######################################
+    GetCommits
+  fi
+}
+
+GetCommitComments() {
+  commits=$1
+
+  for commit in $(echo "${commits}" | jq -r '.[] | @base64'); do
+    _commit_jq() {
+     echo ${commit} | base64 --decode | jq -r ${1}
+    }
+
+    commit_sha=$(_commit_jq '.id')
+    
+    if [ $DEBUG -eq 1 ]; then
+      echo "Getting commit comments"
+      echo curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+      \"$GITLAB_URL/projects/$project_id/repository/commits/$commit_sha/comments?per_page=1\"
+    fi
+
+    comment_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    "$GITLAB_URL/projects/$project_id/repository/commits/$commit_sha/comments?per_page=1")
+
+    comment_response_code=$(echo "${comment_response:(-3)}")
+    comment_data=$(echo "${comment_response}" | grep -Fi '{')
+    comment_ct=$(echo "${comment_response}" | grep -Fi X-Total: | sed 's/^[^:]*: //' | tr -d '\015')
+
+    if [[ "$comment_response_code" != "200" ]]; then
+      echo "Error getting commit comments for project: $owner/$project_name and commit: $commit_sha"
+      echo "${comment_data}"
+    fi
+    
+    ((total_commit_comment_ct+=$comment_ct))
+  done
+}
+
+GetRepoSize(){
+  if [[ ${GET_REPO_SIZE} -eq 1 ]]; then
+    if [ $DEBUG -eq 1 ]; then
+      echo "Getting projects"
+      echo curl -sik -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+      $GITLAB_URL/projects/$project_id?statistics=true
+    fi
+
+    single_repo_response=$(curl -ksi -w '\n%{http_code}' -X GET -H "private-token: $GITLAB_TOKEN" -H "content-type: application/json" \
+    $GITLAB_URL/projects/$project_id?statistics=true)
+
+      if [ $DEBUG -eq 1 ]; then
+        echo "DEBUG --- project RESPONSE:"
+        echo $repo_response
+      fi
+
+    single_repo_response_code=$(echo "${single_repo_response:(-3)}")
+    single_repo_data=$(echo "${single_repo_response}" | grep -Fi '{')
+
+    if [[ "$single_repo_response_code" != "200" ]]; then
+      echo "Error getting Repo: $project_name"
+      echo "${single_repo_data}"
+    else
+      repo_size=$(echo ${single_repo_data} | jq '.statistics.repository_size')
+      echo "Raw size: ${repo_size}"
+      repo_size_kb=$(ConvertBytesToKB "${repo_size}")
+      echo ${repo_size_kb}
+      output_string+=",${repo_size_kb}"
+    fi
+  fi
+}
+
+ReportConflicts(){
+  
+  for (( i=0; i<${#project_list[@]}; i++)) do
+    if (( ${number_of_conflicts[$i]} > 1 )); then
+      echo "${number_of_conflicts[$i]},${project_list[$i]},${group_list[$i]}" >> $conflict_output_file
+    fi
+  done
+
+}
+
+################################################################################
+#### Function ConvertKBToMB ####################################################
+ConvertBytesToKB()
+{
+  ####################################
+  # Value that needs to be converted #
+  ####################################
+  raw_size=$1
+
+
+  # Validate that its a number
+  REGEX='^[0-9]+$'
+  if ! [[ $raw_size =~ $REGEX ]] ; then
+    echo "ERROR! Not a number:$raw_size"
+    exit 1
+  fi
+
+  size_in_kb=$((${raw_size}/1024))
+  echo ${size_in_kb}
+
+}
+################################################################################
+#### Function ValidateJQ #######################################################
+ValidateJQ()
+{
+  # Need to validate the machine has jq installed as we use it to do the parsing
+  # of all the json returns from GitLab
+
+  # See if it is in the path
+  CHECK_JQ=$(which jq)
+
+  ##########################
+  # Check the shell return #
+  ##########################
+  if [ $? -ne 0 ]; then
+    echo "Failed to find jq in the path!"
+    echo "If this is a Mac, run command: brew install jq"
+    echo "If this is Debian, run command: sudo apt install jq"
+    echo "If this is Centos, run command: yum install jq"
+    echo "Once installed, please run this script again."
+    exit 1
+  fi
+}
+################################################################################
+############################## MAIN ############################################
+################################################################################
+
+Header
+
+ValidateJQ
+
+GenerateFiles
+
+if [[ ${ALL_GROUPS} -eq 1 ]]; then
+    echo "------------------------------------------------------"
+    echo "Scanning GitLab for all groups..."
+  next_group_page=1
+  GetGroups
+elif [[ -z ${INPUT_FILE_NAME} ]]; then
+
+    echo "------------------------------------------------------"
+    echo "Scanning GitLab group for projects..."
+    next_repo_page=1
+    GetProjects
+
+else
+  echo "------------------------------------------------------"
+  echo "Scanning GitLab for projects from list of groups..."
+  GetOrgsFromFile
+fi
+
+ReportConflicts
+##########
+# Footer #
+##########
+Footer
